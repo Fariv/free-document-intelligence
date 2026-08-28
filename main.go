@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,9 +9,32 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+type AzureField struct {
+	Type        string `json:"type"`
+	ValueString string `json:"valueString"`
+	Content     string `json:"content"`
+}
+
+type AzureDocument struct {
+	DocType string                `json:"docType"`
+	Fields  map[string]AzureField `json:"fields"`
+}
+
+type AnalyzeResult struct {
+	Documents []AzureDocument `json:"documents"`
+}
+
+type AzureSyncResponse struct {
+	ApiVersion      string        `json:"apiVersion"`
+	Status          string        `json:"status"`
+	CreatedDateTime string        `json:"createdDateTime"`
+	AnalyzeResult   AnalyzeResult `json:"analyzeResult"`
+}
 
 func main() {
 	http.HandleFunc("GET /health", handleHealthCheck)
@@ -124,6 +148,40 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 	} else {
 
 		base64ImgDataUrl = "data:image/jpeg;base64," + base64Img
+
+		extracted, err := CallOllamaOCRModel(base64Img)
+
+		if err != nil {
+			fmt.Printf("[%s] Ollama model processing failed: %v", opID, err)
+			return
+		}
+
+		azureMockData := AnalyzeResult{
+			Documents: []AzureDocument{
+				{
+					DocType: "invoice",
+					Fields: map[string]AzureField{
+						"VendorName":    {Type: "string", ValueString: extracted["SupplierName"], Content: extracted["SupplierName"]},
+						"InvoiceTotal":  {Type: "string", ValueString: extracted["TotalAmount"], Content: extracted["TotalAmount"]},
+						"ValueAddedTax": {Type: "string", ValueString: extracted["VAT"], Content: extracted["VAT"]},
+						"Tax":           {Type: "string", ValueString: extracted["Tax"], Content: extracted["Tax"]},
+					},
+				},
+			},
+		}
+
+		responsePayload := AzureSyncResponse{
+			ApiVersion:      "2024-11-30",
+			Status:          "succeeded",
+			CreatedDateTime: time.Now().Format(time.RFC3339),
+			AnalyzeResult:   azureMockData,
+		}
+
+		fmt.Printf("[%s] Extraction succeeded! JSON is sent directly", opID)
+
+		resp.Header().Set("Content-Type", "application/json")
+		resp.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(resp).Encode(responsePayload)
 	}
 
 	fmt.Printf("Pdf firstpage converts to base64image string: %s", base64ImgDataUrl)
