@@ -1,0 +1,4 @@
+bin/*
+uploads/*
+output/*
+.env
