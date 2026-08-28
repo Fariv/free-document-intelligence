@@ -9,11 +9,12 @@ import (
 )
 
 type OllamaRequest struct {
-	Model  string   `json:"model"`
-	Prompt string   `json:"prompt"`
-	Images []string `json:"images"`
-	Stream bool     `json:"stream"`
-	Format string   `json:"format"`
+	Model     string   `json:"model"`
+	Prompt    string   `json:"prompt"`
+	Images    []string `json:"images"`
+	Stream    bool     `json:"stream"`
+	Format    string   `json:"format"`
+	KeepAlive int      `json:"keep_alive,omitempty"`
 }
 
 type OllamaResponse struct {
@@ -26,11 +27,12 @@ type OllamaResponse struct {
 func CallOllamaOCRModel(base64ImageStr string) (map[string]string, error) {
 	prompt := getprompt()
 	payload := OllamaRequest{
-		Model:  "glm-ocr:bf16",
-		Prompt: prompt,
-		Images: []string{base64ImageStr},
-		Stream: false,
-		Format: "json",
+		Model:     "glm-ocr:bf16",
+		Prompt:    prompt,
+		Images:    []string{base64ImageStr},
+		Stream:    false,
+		Format:    "json",
+		KeepAlive: 0,
 	}
 
 	jsonPayload, err := json.Marshal(payload)
