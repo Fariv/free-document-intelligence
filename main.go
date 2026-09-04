@@ -156,6 +156,9 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 	// Create task record
 	err = dbStore.CreateTask(opID)
 	if err != nil {
+		if removeErr := os.Remove(finalFilepath); removeErr != nil && !os.IsNotExist(removeErr) {
+			fmt.Printf("Failed to remove uploaded file %s: %v\n", finalFilepath, removeErr)
+		}
 		http.Error(resp, "Failed to create task", http.StatusInternalServerError)
 		return
 	}
@@ -170,6 +173,10 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 		processInvoiceAsync(job)
 	})
 	if err != nil {
+		if removeErr := os.Remove(finalFilepath); removeErr != nil && !os.IsNotExist(removeErr) {
+			fmt.Printf("Failed to remove uploaded file %s: %v\n", finalFilepath, removeErr)
+		}
+		dbStore.UpdateTask(opID, "failed", nil, err.Error())
 		http.Error(resp, "Failed to submit job to worker pool", http.StatusInternalServerError)
 		return
 	}
@@ -190,6 +197,11 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 func processInvoiceAsync(job InvoiceJob) {
 	opID := job.OperationID
 	filePath := job.FilePath
+	defer func() {
+		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("[%s] Failed to remove uploaded file %s: %v\n", opID, filePath, err)
+		}
+	}()
 
 	fmt.Printf("[%s] Starting async processing...\n", opID)
 
