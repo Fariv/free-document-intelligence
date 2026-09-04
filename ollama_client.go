@@ -24,12 +24,12 @@ type OllamaResponse struct {
 	Done      bool      `json:"done"`
 }
 
-func CallOllamaOCRModel(base64ImageStr string) (map[string]string, error) {
+func CallOllamaOCRModel(base64ImageStr []string) (map[string]string, error) {
 	prompt := getprompt()
 	payload := OllamaRequest{
 		Model:     "glm-ocr:bf16",
 		Prompt:    prompt,
-		Images:    []string{base64ImageStr},
+		Images:    base64ImageStr,
 		Stream:    false,
 		Format:    "json",
 		KeepAlive: 0,

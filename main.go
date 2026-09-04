@@ -42,7 +42,7 @@ func main() {
 
 	var port int = 8082
 	fmt.Printf("Server starting at http://localhost:%d\n", port)
-	if serverErr := http.ListenAndServe(":8082", nil); serverErr != nil {
+	if serverErr := http.ListenAndServe(":"+fmt.Sprint(port), nil); serverErr != nil {
 		panic(serverErr)
 	}
 }
@@ -131,60 +131,47 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 
 	var pagenum int
 	pagenum = 0
-	// outputpath := fmt.Sprintf("./output/page-%d.jpg", pagenum)
-	// isFile := true
 	outputpath := ""
 	isFile := false
-	base64Img, err := ConvertPdfToBase64Image(finalFilepath, pagenum, &outputpath, &isFile)
+	base64Imgs, err := ConvertPdfToBase64Image(finalFilepath, pagenum, &outputpath, &isFile)
 	if err != nil {
 		http.Error(resp, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	var base64ImgDataUrl string
-	if isFile {
+	extracted, err := CallOllamaOCRModel(base64Imgs)
 
-		base64ImgDataUrl = base64Img
-	} else {
-
-		base64ImgDataUrl = "data:image/jpeg;base64," + base64Img
-
-		extracted, err := CallOllamaOCRModel(base64Img)
-
-		if err != nil {
-			fmt.Printf("[%s] Ollama model processing failed: %v", opID, err)
-			return
-		}
-
-		azureMockData := AnalyzeResult{
-			Documents: []AzureDocument{
-				{
-					DocType: "invoice",
-					Fields: map[string]AzureField{
-						"VendorName":    {Type: "string", ValueString: extracted["SupplierName"], Content: extracted["SupplierName"]},
-						"InvoiceTotal":  {Type: "string", ValueString: extracted["TotalAmount"], Content: extracted["TotalAmount"]},
-						"ValueAddedTax": {Type: "string", ValueString: extracted["VAT"], Content: extracted["VAT"]},
-						"Tax":           {Type: "string", ValueString: extracted["Tax"], Content: extracted["Tax"]},
-					},
-				},
-			},
-		}
-
-		responsePayload := AzureSyncResponse{
-			ApiVersion:      "2024-11-30",
-			Status:          "succeeded",
-			CreatedDateTime: time.Now().Format(time.RFC3339),
-			AnalyzeResult:   azureMockData,
-		}
-
-		fmt.Printf("[%s] Extraction succeeded! JSON is sent directly", opID)
-
-		resp.Header().Set("Content-Type", "application/json")
-		resp.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(resp).Encode(responsePayload)
+	if err != nil {
+		fmt.Printf("[%s] Ollama model processing failed: %v", opID, err)
+		return
 	}
 
-	fmt.Printf("Pdf firstpage converts to base64image string: %s", base64ImgDataUrl)
+	azureMockData := AnalyzeResult{
+		Documents: []AzureDocument{
+			{
+				DocType: "invoice",
+				Fields: map[string]AzureField{
+					"VendorName":    {Type: "string", ValueString: extracted["SupplierName"], Content: extracted["SupplierName"]},
+					"InvoiceTotal":  {Type: "string", ValueString: extracted["TotalAmount"], Content: extracted["TotalAmount"]},
+					"ValueAddedTax": {Type: "string", ValueString: extracted["VAT"], Content: extracted["VAT"]},
+					"Tax":           {Type: "string", ValueString: extracted["Tax"], Content: extracted["Tax"]},
+				},
+			},
+		},
+	}
+
+	responsePayload := AzureSyncResponse{
+		ApiVersion:      "2024-11-30",
+		Status:          "succeeded",
+		CreatedDateTime: time.Now().Format(time.RFC3339),
+		AnalyzeResult:   azureMockData,
+	}
+
+	fmt.Printf("[%s] Extraction succeeded! JSON is sent directly", opID)
+
+	resp.Header().Set("Content-Type", "application/json")
+	resp.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(resp).Encode(responsePayload)
 }
 
 func stripos(haystack, needle string) int {
