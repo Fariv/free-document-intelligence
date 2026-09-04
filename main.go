@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/panjf2000/ants/v2"
 )
 
 type AzureField struct {
@@ -36,9 +37,32 @@ type AzureSyncResponse struct {
 	AnalyzeResult   AnalyzeResult `json:"analyzeResult"`
 }
 
+var (
+	dbStore    TaskRepository
+	workerPool *ants.Pool
+)
+
+type InvoiceJob struct {
+	FilePath    string
+	OperationID string
+}
+
 func main() {
+	dbStore = NewMemoryStore()
+
+	var err error
+	workerPool, err = ants.NewPool(2)
+	if err != nil {
+		fmt.Printf("Failed to create ants pool: %v", err)
+	}
+	defer workerPool.Release()
+
+	// Start cleanup worker for expired tasks (2 minute TTL for testing)
+	dbStore.StartCleanupWorker(2 * time.Minute)
+
 	http.HandleFunc("GET /health", handleHealthCheck)
-	http.HandleFunc("/documentintelligence/documentModels/prebuilt-invoice:analyze", handleAnalyzePOST)
+	http.HandleFunc("POST /documentintelligence/documentModels/prebuilt-invoice:analyze", handleAnalyzePOST)
+	http.HandleFunc("GET /documentintelligence/documentModels/prebuilt-invoice/analyzeResults/{opID}", handleGetAnalyzeResults)
 
 	var port int = 8082
 	fmt.Printf("Server starting at http://localhost:%d\n", port)
@@ -129,23 +153,67 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 	fmt.Printf("Final Filepath: %s\n", finalFilepath)
 	fmt.Printf("---------------------------\n")
 
-	var pagenum int
-	pagenum = 0
+	// Create task record
+	err = dbStore.CreateTask(opID)
+	if err != nil {
+		http.Error(resp, "Failed to create task", http.StatusInternalServerError)
+		return
+	}
+
+	// Submit async job to worker pool
+	job := InvoiceJob{
+		FilePath:    finalFilepath,
+		OperationID: opID,
+	}
+
+	err = workerPool.Submit(func() {
+		processInvoiceAsync(job)
+	})
+	if err != nil {
+		http.Error(resp, "Failed to submit job to worker pool", http.StatusInternalServerError)
+		return
+	}
+
+	// Return 202 Accepted with operation ID
+	resp.Header().Set("Content-Type", "application/json")
+	resp.Header().Set("Location", fmt.Sprintf("/documentintelligence/documentModels/prebuilt-invoice/analyzeResults/%s", opID))
+	resp.WriteHeader(http.StatusAccepted)
+
+	responseBody := map[string]interface{}{
+		"operationId": opID,
+		"status":      "processing",
+	}
+	json.NewEncoder(resp).Encode(responseBody)
+}
+
+// processInvoiceAsync processes the invoice PDF asynchronously
+func processInvoiceAsync(job InvoiceJob) {
+	opID := job.OperationID
+	filePath := job.FilePath
+
+	fmt.Printf("[%s] Starting async processing...\n", opID)
+
+	var pagenum int = 0
 	outputpath := ""
 	isFile := false
-	base64Imgs, err := ConvertPdfToBase64Image(finalFilepath, pagenum, &outputpath, &isFile)
+
+	// Convert PDF to base64 images
+	base64Imgs, err := ConvertPdfToBase64Image(filePath, pagenum, &outputpath, &isFile)
 	if err != nil {
-		http.Error(resp, err.Error(), http.StatusInternalServerError)
+		fmt.Printf("[%s] PDF conversion failed: %v\n", opID, err)
+		dbStore.UpdateTask(opID, "failed", nil, err.Error())
 		return
 	}
 
+	// Call Ollama OCR model
 	extracted, err := CallOllamaOCRModel(base64Imgs)
-
 	if err != nil {
-		fmt.Printf("[%s] Ollama model processing failed: %v", opID, err)
+		fmt.Printf("[%s] Ollama model processing failed: %v\n", opID, err)
+		dbStore.UpdateTask(opID, "failed", nil, err.Error())
 		return
 	}
 
+	// Build Azure-compatible response
 	azureMockData := AnalyzeResult{
 		Documents: []AzureDocument{
 			{
@@ -167,11 +235,33 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 		AnalyzeResult:   azureMockData,
 	}
 
-	fmt.Printf("[%s] Extraction succeeded! JSON is sent directly", opID)
+	// Update task with success
+	fmt.Printf("[%s] Extraction succeeded!\n", opID)
+	dbStore.UpdateTask(opID, "succeeded", responsePayload, "")
+}
+
+// handleGetAnalyzeResults retrieves the status and results of an analysis task
+func handleGetAnalyzeResults(resp http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(resp, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	opID := req.PathValue("opID")
+	if opID == "" {
+		http.Error(resp, "Operation ID is required", http.StatusBadRequest)
+		return
+	}
+
+	task, err := dbStore.GetTask(opID)
+	if err != nil {
+		http.Error(resp, err.Error(), http.StatusNotFound)
+		return
+	}
 
 	resp.Header().Set("Content-Type", "application/json")
 	resp.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(resp).Encode(responsePayload)
+	json.NewEncoder(resp).Encode(task)
 }
 
 func stripos(haystack, needle string) int {

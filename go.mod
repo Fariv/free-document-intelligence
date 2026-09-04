@@ -2,7 +2,12 @@ module github.com/fariv/free-document-intelligence
 
 go 1.25.5
 
-require github.com/google/uuid v1.6.0
+require (
+	github.com/google/uuid v1.6.0
+	github.com/panjf2000/ants/v2 v2.12.1
+)
+
+require golang.org/x/sync v0.22.0 // indirect
 
 require (
 	github.com/jolestar/go-commons-pool/v2 v2.1.2 // indirect
