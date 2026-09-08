@@ -19,12 +19,13 @@ import (
 )
 
 type AzureField struct {
-	Type          string         `json:"type"`
-	Content       string         `json:"content,omitempty"`
-	ValueString   string         `json:"valueString,omitempty"`
-	ValueDate     string         `json:"valueDate,omitempty"`
-	ValueCurrency *CurrencyValue `json:"valueCurrency,omitempty"`
-	ValueNumber   *float64       `json:"valueNumber,omitempty"`
+	Type          string                  `json:"type"`
+	Content       string                  `json:"content,omitempty"`
+	ValueString   string                  `json:"valueString,omitempty"`
+	ValueDate     string                  `json:"valueDate,omitempty"`
+	ValueCurrency *CurrencyValue          `json:"valueCurrency,omitempty"`
+	ValueNumber   *float64                `json:"valueNumber,omitempty"`
+	ValueArray    []map[string]AzureField `json:"valueArray,omitempty"`
 }
 
 type CurrencyValue struct {
@@ -210,6 +211,16 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if status, ok := simulatedStatus(req.Header.Get("X-Simulate-Status")); ok {
+		resp.Header().Set("Content-Type", "application/json")
+		if status == http.StatusTooManyRequests {
+			resp.Header().Set("Retry-After", "2")
+		}
+		resp.WriteHeader(status)
+		json.NewEncoder(resp).Encode(errorJSON(simulatedErrorCode(status), simulatedErrorMessage(status)))
+		return
+	}
+
 	modelID := modelIDFromURL(req.URL.Path)
 	if modelID == "" {
 		writeError(resp, http.StatusBadRequest, "InvalidModel", "Unsupported model ID")
@@ -316,6 +327,10 @@ func processInvoiceAsync(job InvoiceJob) {
 	opID := job.OperationID
 	filePath := job.FilePath
 	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[%s] Worker panic recovered: %v\n", opID, r)
+			opStore.Update(opID, "failed", nil, fmt.Sprintf("worker panic: %v", r))
+		}
 		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 			fmt.Printf("[%s] Failed to remove uploaded file %s: %v\n", opID, filePath, err)
 		}
@@ -359,6 +374,15 @@ func processInvoiceAsync(job InvoiceJob) {
 func handleGetAnalyzeResults(resp http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		writeError(resp, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method Not Allowed")
+		return
+	}
+	if status, ok := simulatedStatus(req.Header.Get("X-Simulate-Status")); ok {
+		resp.Header().Set("Content-Type", "application/json")
+		if status == http.StatusTooManyRequests {
+			resp.Header().Set("Retry-After", "2")
+		}
+		resp.WriteHeader(status)
+		json.NewEncoder(resp).Encode(errorJSON(simulatedErrorCode(status), simulatedErrorMessage(status)))
 		return
 	}
 	if req.URL.Query().Get("api-version") != apiVersion {
@@ -523,9 +547,16 @@ func mapFieldValueToAzureField(name string, fv FieldValue) AzureField {
 			field.Content = s
 		}
 		if obj, ok := fv.Value.(map[string]any); ok {
-			amount, _ := obj["amount"].(float64)
-			code, _ := obj["currencyCode"].(string)
-			field.ValueCurrency = &CurrencyValue{Amount: amount, CurrencyCode: code}
+			if amount, ok := obj["amount"].(float64); ok {
+				field.ValueCurrency = &CurrencyValue{Amount: amount, CurrencyCode: obj["currencyCode"].(string)}
+			}
+			if code, ok := obj["currencyCode"].(string); ok {
+				if field.ValueCurrency == nil {
+					field.ValueCurrency = &CurrencyValue{CurrencyCode: code}
+				} else {
+					field.ValueCurrency.CurrencyCode = code
+				}
+			}
 		}
 	}
 	if fv.Type == "number" {
@@ -538,11 +569,55 @@ func mapFieldValueToAzureField(name string, fv FieldValue) AzureField {
 		}
 	}
 	if fv.Type == "array" {
-		if items, ok := fv.Value.([]map[string]FieldValue); ok {
-			_ = items
+		if arrayValue, ok := fv.Value.([]map[string]FieldValue); ok {
+			rows := make([]map[string]AzureField, 0, len(arrayValue))
+			for _, item := range arrayValue {
+				row := map[string]AzureField{}
+				for key, inner := range item {
+					row[key] = mapFieldValueToAzureField(key, inner)
+				}
+				rows = append(rows, row)
+			}
+			field.ValueArray = rows
 		}
 	}
 	return field
+}
+
+func simulatedStatus(header string) (int, bool) {
+	text := strings.TrimSpace(strings.ToLower(header))
+	if text == "" {
+		return 0, false
+	}
+	if text == "429" || strings.HasPrefix(text, "429 ") {
+		return http.StatusTooManyRequests, true
+	}
+	if text == "503" || strings.HasPrefix(text, "503 ") {
+		return http.StatusServiceUnavailable, true
+	}
+	return 0, false
+}
+
+func simulatedErrorCode(status int) string {
+	switch status {
+	case http.StatusTooManyRequests:
+		return "RequestRateTooLarge"
+	case http.StatusServiceUnavailable:
+		return "ServiceUnavailable"
+	default:
+		return "SimulatedFailure"
+	}
+}
+
+func simulatedErrorMessage(status int) string {
+	switch status {
+	case http.StatusTooManyRequests:
+		return "Request rate limit exceeded."
+	case http.StatusServiceUnavailable:
+		return "The service is temporarily unavailable."
+	default:
+		return "Simulation triggered a transient failure."
+	}
 }
 
 func stripos(haystack, needle string) int {

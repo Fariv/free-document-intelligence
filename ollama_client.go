@@ -39,9 +39,7 @@ type InternalInvoice struct {
 	CustomerName    *string               `json:"customerName"`
 	CustomerAddress *string               `json:"customerAddress"`
 	InvoiceDate     *string               `json:"invoiceDate"`
-	InvoiceDateText *string               `json:"invoiceDateText"`
 	DueDate         *string               `json:"dueDate"`
-	DueDateText     *string               `json:"dueDateText"`
 	PurchaseOrder   *string               `json:"purchaseOrder"`
 	Subtotal        *float64              `json:"subtotal"`
 	TotalTax        *float64              `json:"totalTax"`
@@ -134,42 +132,36 @@ func parseOllamaJSON(raw string, modelID string) (*AnalysisResult, error) {
 	if clean == "" {
 		return nil, fmt.Errorf("empty response from ollama")
 	}
-	if strings.HasPrefix(clean, "{") {
-		var invoice InternalInvoice
-		if err := json.Unmarshal([]byte(clean), &invoice); err == nil {
-			if invoice.DocumentType == "" {
-				invoice.DocumentType = "invoice"
+	if !strings.HasPrefix(clean, "{") {
+		return nil, fmt.Errorf("failed to parse model's internal JSON response: %s", clean)
+	}
+
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(clean), &envelope); err == nil {
+		if fieldsRaw, ok := envelope["fields"].(map[string]any); ok {
+			result := &AnalysisResult{Content: "", DocumentType: "invoice", Fields: map[string]FieldValue{}}
+			if content, ok := envelope["content"].(string); ok {
+				result.Content = content
 			}
-			if strings.Contains(invoice.Content, "full readable text from the document") {
-				return nil, fmt.Errorf("model returned prompt placeholder instead of extracted content")
+			if docType, ok := envelope["documentType"].(string); ok && docType != "" {
+				result.DocumentType = docType
 			}
-			result := &AnalysisResult{Content: invoice.Content, DocumentType: invoice.DocumentType, Fields: map[string]FieldValue{}}
-			result.Fields["InvoiceId"] = makeStringField(invoice.InvoiceID)
-			result.Fields["VendorName"] = makeStringField(invoice.VendorName)
-			result.Fields["VendorAddress"] = makeStringField(invoice.VendorAddress)
-			result.Fields["CustomerName"] = makeStringField(invoice.CustomerName)
-			result.Fields["CustomerAddress"] = makeStringField(invoice.CustomerAddress)
-			result.Fields["InvoiceDate"] = makeDateField(invoice.InvoiceDate, invoice.InvoiceDateText)
-			result.Fields["DueDate"] = makeDateField(invoice.DueDate, invoice.DueDateText)
-			result.Fields["PurchaseOrder"] = makeStringField(invoice.PurchaseOrder)
-			result.Fields["SubTotal"] = makeCurrencyField(invoice.Subtotal, invoice.Currency)
-			result.Fields["TotalTax"] = makeCurrencyField(invoice.TotalTax, invoice.Currency)
-			result.Fields["InvoiceTotal"] = makeCurrencyField(invoice.InvoiceTotal, invoice.Currency)
-			result.Fields["AmountDue"] = makeCurrencyField(invoice.AmountDue, invoice.Currency)
-			result.Fields["Currency"] = makeStringField(invoice.Currency)
-			items := make([]map[string]FieldValue, 0, len(invoice.Items))
-			for _, item := range invoice.Items {
-				items = append(items, map[string]FieldValue{
-					"Description": makeStringField(item.Description),
-					"Quantity":    makeNumberField(item.Quantity),
-					"UnitPrice":   makeCurrencyField(item.UnitPrice, invoice.Currency),
-					"ProductCode": makeStringField(item.ProductCode),
-					"Tax":         makeCurrencyField(item.Tax, invoice.Currency),
-					"Amount":      makeCurrencyField(item.Amount, invoice.Currency),
-				})
+			if docType, ok := envelope["docType"].(string); ok && docType != "" {
+				result.DocumentType = docType
 			}
-			result.Fields["Items"] = FieldValue{Type: "array", Value: items}
+			for fieldName, rawField := range fieldsRaw {
+				fieldMap, ok := rawField.(map[string]any)
+				if !ok {
+					continue
+				}
+				result.Fields[fieldName] = normalizeFieldValue(fieldMap)
+			}
 			return result, nil
+		}
+
+		parsed, err := parseInvoiceEnvelope(envelope)
+		if err == nil {
+			return parsed, nil
 		}
 	}
 
@@ -183,6 +175,172 @@ func parseOllamaJSON(raw string, modelID string) (*AnalysisResult, error) {
 	}
 
 	return nil, fmt.Errorf("failed to parse model's internal JSON response: %s", clean)
+}
+
+func parseInvoiceEnvelope(envelope map[string]any) (*AnalysisResult, error) {
+	if strings.Contains(fmt.Sprint(envelope["content"]), "full readable text from the document") {
+		return nil, fmt.Errorf("model returned prompt placeholder instead of extracted content")
+	}
+
+	result := &AnalysisResult{Content: "", DocumentType: "invoice", Fields: map[string]FieldValue{}}
+	if content, ok := envelope["content"].(string); ok {
+		result.Content = content
+	}
+	if docType, ok := envelope["documentType"].(string); ok && docType != "" {
+		result.DocumentType = docType
+	}
+	if docType, ok := envelope["docType"].(string); ok && docType != "" {
+		result.DocumentType = docType
+	}
+
+	result.Fields["InvoiceId"] = makeStringField(stringPtrFromAny(envelope["invoiceId"]))
+	result.Fields["VendorName"] = makeStringField(stringPtrFromAny(envelope["vendorName"]))
+	result.Fields["VendorAddress"] = makeStringField(stringPtrFromAny(envelope["vendorAddress"]))
+	result.Fields["CustomerName"] = makeStringField(stringPtrFromAny(envelope["customerName"]))
+	result.Fields["CustomerAddress"] = makeStringField(stringPtrFromAny(envelope["customerAddress"]))
+	result.Fields["InvoiceDate"] = makeDateField(stringPtrFromAny(envelope["invoiceDate"]))
+	result.Fields["DueDate"] = makeDateField(stringPtrFromAny(envelope["dueDate"]))
+	result.Fields["PurchaseOrder"] = makeStringField(stringPtrFromAny(envelope["purchaseOrder"]))
+
+	valueSubtotal := numberPtrFromAny(envelope["subtotal"])
+	valueTax := numberPtrFromAny(envelope["totalTax"])
+	valueInvoiceTotal := numberPtrFromAny(envelope["invoiceTotal"])
+	valueAmountDue := numberPtrFromAny(envelope["amountDue"])
+
+	currencyCode := normalizeCurrencyCode(stringValueFromAny(envelope["currency"]))
+	currencyPtr := stringPtrFromAny(currencyCode)
+	result.Fields["SubTotal"] = makeCurrencyField(valueSubtotal, currencyPtr)
+	result.Fields["TotalTax"] = makeCurrencyField(valueTax, currencyPtr)
+	result.Fields["InvoiceTotal"] = makeCurrencyField(valueInvoiceTotal, currencyPtr)
+	result.Fields["AmountDue"] = makeCurrencyField(valueAmountDue, currencyPtr)
+	result.Fields["CurrencyCode"] = makeStringField(currencyPtr)
+
+	items := make([]map[string]FieldValue, 0)
+	if rawItems, ok := envelope["items"].([]any); ok {
+		for _, rawItem := range rawItems {
+			object, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			items = append(items, map[string]FieldValue{
+				"Description": makeStringField(stringPtrFromAny(object["description"])),
+				"Quantity":    makeNumberField(numberPtrFromAny(object["quantity"])),
+				"UnitPrice":   makeCurrencyField(numberPtrFromAny(object["unitPrice"]), currencyPtr),
+				"ProductCode": makeStringField(stringPtrFromAny(object["productCode"])),
+				"Tax":         makeCurrencyField(numberPtrFromAny(object["tax"]), currencyPtr),
+				"Amount":      makeCurrencyField(numberPtrFromAny(object["amount"]), currencyPtr),
+			})
+		}
+	}
+	result.Fields["Items"] = FieldValue{Type: "array", Value: items}
+	return result, nil
+}
+
+func normalizeFieldValue(field map[string]any) FieldValue {
+	kind, _ := field["type"].(string)
+	fieldValue := FieldValue{Type: kind}
+	if rawContent, ok := field["content"]; ok && rawContent != nil {
+		fieldValue.Content = rawContent
+	}
+	if rawValue, ok := field["value"]; ok && rawValue != nil {
+		fieldValue.Value = rawValue
+	}
+	if rawString, ok := field["valueString"].(string); ok {
+		fieldValue.Value = rawString
+	}
+	if rawDate, ok := field["valueDate"].(string); ok {
+		fieldValue.Value = rawDate
+	}
+	if rawNumber, ok := field["valueNumber"].(float64); ok {
+		fieldValue.Value = rawNumber
+	}
+	return fieldValue
+}
+
+func stringPtrFromAny(value any) *string {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		return &v
+	case float64:
+		str := fmt.Sprintf("%.0f", v)
+		return &str
+	case bool:
+		str := strconv.FormatBool(v)
+		return &str
+	default:
+		if str, ok := value.(fmt.Stringer); ok {
+			text := str.String()
+			if strings.TrimSpace(text) == "" {
+				return nil
+			}
+			return &text
+		}
+		return nil
+	}
+}
+
+func numberPtrFromAny(value any) *float64 {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case float64:
+		return &v
+	case int:
+		f := float64(v)
+		return &f
+	case string:
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return nil
+		}
+		f, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			return nil
+		}
+		return &f
+	default:
+		return nil
+	}
+}
+
+func stringValueFromAny(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func normalizeCurrencyCode(code string) string {
+	text := strings.TrimSpace(code)
+	if text == "" {
+		return ""
+	}
+	upper := strings.ToUpper(text)
+	switch upper {
+	case "₹", "RS", "RUPPEE", "INR", "RS.", "₹INR":
+		return "INR"
+	case "$", "USD":
+		return "USD"
+	case "€", "EUR":
+		return "EUR"
+	case "£", "GBP":
+		return "GBP"
+	case "BDT":
+		return "BDT"
+	default:
+		return upper
+	}
 }
 
 func makeStringField(value *string) FieldValue {
@@ -199,19 +357,11 @@ func makeNumberField(value *float64) FieldValue {
 	return FieldValue{Type: "number", Content: *value, Value: *value}
 }
 
-func makeDateField(dateText *string, visibleText *string) FieldValue {
-	if dateText == nil && visibleText == nil {
+func makeDateField(dateText *string) FieldValue {
+	if dateText == nil {
 		return FieldValue{Type: "date", Content: nil, Value: nil}
 	}
-	content := ""
-	if visibleText != nil {
-		content = *visibleText
-	}
-	value := ""
-	if dateText != nil {
-		value = *dateText
-	}
-	return FieldValue{Type: "date", Content: content, Value: value}
+	return FieldValue{Type: "date", Content: *dateText, Value: *dateText}
 }
 
 func makeCurrencyField(value *float64, currency *string) FieldValue {
@@ -252,9 +402,7 @@ Return exactly this shape:
   "customerName": null,
   "customerAddress": null,
   "invoiceDate": null,
-  "invoiceDateText": null,
   "dueDate": null,
-  "dueDateText": null,
   "purchaseOrder": null,
   "subtotal": null,
   "totalTax": null,
@@ -270,13 +418,11 @@ Rules:
 - vendorName: issuer/seller.
 - customerName: bill-to/customer.
 - invoiceDate/dueDate: normalized YYYY-MM-DD when unambiguous.
-- invoiceDateText/dueDateText: original visible date text.
 - subtotal, totalTax, invoiceTotal, amountDue: JSON numbers only.
 - currency: ISO currency code such as USD, EUR, GBP, BDT, or null.
 - items: extract actual product/service rows.
 - Do not put subtotal/tax/total rows in items.
 - Do not assume invoiceTotal equals amountDue unless the document clearly says so.
-- If a numeric date is ambiguous, normalized date must be null while the original text remains available.
 
 Each item must have this shape:
 
