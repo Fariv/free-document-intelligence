@@ -5,12 +5,32 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"image"
 	"image/jpeg"
 	"os"
 
 	"github.com/klippa-app/go-pdfium/requests"
 	"github.com/klippa-app/go-pdfium/webassembly"
 )
+
+func encodeImageToBase64Slices(filePath string) ([]string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("image open failed: %w", err)
+	}
+	defer f.Close()
+
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil, fmt.Errorf("image decode failed: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+		return nil, fmt.Errorf("image jpeg encode failed: %w", err)
+	}
+	return []string{base64.StdEncoding.EncodeToString(buf.Bytes())}, nil
+}
 
 func ConvertPdfToBase64Image(pdfpath string, pagenum int, outputPath *string, isFile *bool) ([]string, error) {
 	pool, err := webassembly.Init(webassembly.Config{
