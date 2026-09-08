@@ -56,6 +56,24 @@ bin/fdi
 
 The server listens on the configured `PORT`, or `8082` by default.
 
+## Prerequisites
+
+Before running the service locally, make sure the following are available:
+
+- Go 1.22+ or the version that matches your workspace `go.mod`.
+- A local Ollama service listening at `http://localhost:11434` or the value in `OLLAMA_BASE_URL`.
+- The OCR model installed locally:
+
+```sh
+ollama pull glm-ocr:bf16
+```
+
+- A working PDF/image conversion dependency. The PDF path uses the `go-pdfium` WebAssembly integration, so a local Go runtime and the repository dependencies are required.
+- Enough local RAM and CPU to run Ollama. The OCR model is a vision-capable model and can run best on a machine with a compatible GPU, though CPU execution may also work if your Ollama setup has the model available.
+- A local environment file such as `.env` copied from `.env.example`.
+
+If you do not have a GPU, CPU execution can still work for local testing, but it tends to be slower and may fail if the model memory or token settings exceed the hardware limitations of your environment.
+
 ## Request example
 
 ### Analyze invoice PDF
