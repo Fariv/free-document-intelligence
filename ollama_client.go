@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -57,12 +59,12 @@ type OllamaResponse struct {
 	Error     string    `json:"error,omitempty"`
 }
 
-func CallOllamaOCRModel(base64ImageStr []string, modelID string) (*AnalysisResult, error) {
+func CallOllamaOCRModel(base64ImageStr []string, modelID string, locale string) (*AnalysisResult, error) {
 	if len(base64ImageStr) == 0 {
 		return nil, fmt.Errorf("images=0 integration bug: no image payload attached to ollama request")
 	}
 
-	prompt := promptForModel(modelID)
+	prompt := promptForModel(modelID, locale)
 	payload := OllamaRequest{
 		Model:     modelName(),
 		Prompt:    prompt,
@@ -93,8 +95,21 @@ func CallOllamaOCRModel(base64ImageStr []string, modelID string) (*AnalysisResul
 
 	fmt.Printf("model=%s images=%d image_bytes=%d prompt_version=invoice-v2\n", modelName(), len(base64ImageStr), len(base64ImageStr[0]))
 
-	resp, err := http.Post(ollamaEndpoint, "application/json", bytes.NewBuffer(jsonPayload))
+	timeout := ollamaHTTPRequestTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ollamaEndpoint, bytes.NewBuffer(jsonPayload))
 	if err != nil {
+		return nil, fmt.Errorf("failed to build ollama request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("ollama request timed out after %s", timeout)
+		}
 		return nil, fmt.Errorf("failed to connect to Ollama server: %w", err)
 	}
 	defer resp.Body.Close()
@@ -110,7 +125,7 @@ func CallOllamaOCRModel(base64ImageStr []string, modelID string) (*AnalysisResul
 		return nil, fmt.Errorf("ollama returned error: %s", ollamaResp.Error)
 	}
 
-	parsed, err := parseOllamaJSON(ollamaResp.Response, modelID)
+	parsed, err := parseOllamaJSONForLocale(ollamaResp.Response, modelID, locale)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +133,10 @@ func CallOllamaOCRModel(base64ImageStr []string, modelID string) (*AnalysisResul
 }
 
 func parseOllamaJSON(raw string, modelID string) (*AnalysisResult, error) {
+	return parseOllamaJSONForLocale(raw, modelID, "en-GB")
+}
+
+func parseOllamaJSONForLocale(raw string, modelID string, locale string) (*AnalysisResult, error) {
 	clean := strings.TrimSpace(raw)
 	if clean == "" {
 		return nil, fmt.Errorf("empty response from ollama")
@@ -154,12 +173,12 @@ func parseOllamaJSON(raw string, modelID string) (*AnalysisResult, error) {
 				if !ok {
 					continue
 				}
-				result.Fields[fieldName] = normalizeFieldValue(fieldMap)
+				result.Fields[fieldName] = normalizeFieldValueForLocale(fieldMap, locale)
 			}
 			return result, nil
 		}
 
-		parsed, err := parseInvoiceEnvelope(envelope)
+		parsed, err := parseInvoiceEnvelopeForLocale(envelope, locale)
 		if err == nil {
 			return parsed, nil
 		}
@@ -178,6 +197,10 @@ func parseOllamaJSON(raw string, modelID string) (*AnalysisResult, error) {
 }
 
 func parseInvoiceEnvelope(envelope map[string]any) (*AnalysisResult, error) {
+	return parseInvoiceEnvelopeForLocale(envelope, "en-GB")
+}
+
+func parseInvoiceEnvelopeForLocale(envelope map[string]any, locale string) (*AnalysisResult, error) {
 	if strings.Contains(fmt.Sprint(envelope["content"]), "full readable text from the document") {
 		return nil, fmt.Errorf("model returned prompt placeholder instead of extracted content")
 	}
@@ -198,8 +221,8 @@ func parseInvoiceEnvelope(envelope map[string]any) (*AnalysisResult, error) {
 	result.Fields["VendorAddress"] = makeStringField(stringPtrFromAny(envelope["vendorAddress"]))
 	result.Fields["CustomerName"] = makeStringField(stringPtrFromAny(envelope["customerName"]))
 	result.Fields["CustomerAddress"] = makeStringField(stringPtrFromAny(envelope["customerAddress"]))
-	result.Fields["InvoiceDate"] = makeDateField(stringPtrFromAny(envelope["invoiceDate"]))
-	result.Fields["DueDate"] = makeDateField(stringPtrFromAny(envelope["dueDate"]))
+	result.Fields["InvoiceDate"] = makeDateFieldForLocale(stringPtrFromAny(envelope["invoiceDate"]), locale)
+	result.Fields["DueDate"] = makeDateFieldForLocale(stringPtrFromAny(envelope["dueDate"]), locale)
 	result.Fields["PurchaseOrder"] = makeStringField(stringPtrFromAny(envelope["purchaseOrder"]))
 
 	valueSubtotal := numberPtrFromAny(envelope["subtotal"])
@@ -233,10 +256,333 @@ func parseInvoiceEnvelope(envelope map[string]any) (*AnalysisResult, error) {
 		}
 	}
 	result.Fields["Items"] = FieldValue{Type: "array", Value: items}
+
+	if rawTaxDetails, ok := envelope["taxDetails"].([]any); ok {
+		rows := make([]map[string]FieldValue, 0, len(rawTaxDetails))
+		for _, rawRow := range rawTaxDetails {
+			rowObj, ok := rawRow.(map[string]any)
+			if !ok {
+				continue
+			}
+			amount := makeCurrencyField(numberPtrFromAny(rowObj["amount"]), currencyPtr)
+			amount.Content = fmt.Sprintf("%.2f", valueOrAmountMoney(numberPtrFromAny(rowObj["amount"])))
+			rate := makeStringField(stringPtrFromAny(rowObj["rate"]))
+			rows = append(rows, map[string]FieldValue{
+				"Amount": amount,
+				"Rate":   rate,
+			})
+		}
+		result.Fields["TaxDetails"] = FieldValue{Type: "array", Value: rows}
+	}
+
+	if result.Content != "" {
+		inferInvoiceFieldsFromContent(result, result.Content)
+	}
 	return result, nil
 }
 
+func inferInvoiceFieldsFromContent(result *AnalysisResult, content string) {
+	text := strings.TrimSpace(content)
+	lines := splitLines(text)
+	code := inferCurrencyCodeFromText(text)
+	if code != "" && !hasFieldValue(result.Fields["CurrencyCode"]) {
+		result.Fields["CurrencyCode"] = makeStringField(stringPtrFromAny(code))
+	}
+
+	if !hasFieldValue(result.Fields["InvoiceId"]) {
+		if id := extractValueAfterLabel(lines, []string{"invoice no", "invoice #", "invoice number", "invoice id", "ref"}); id != "" {
+			result.Fields["InvoiceId"] = makeStringField(stringPtrFromAny(id))
+		}
+	}
+	if !hasFieldValue(result.Fields["InvoiceTotal"]) {
+		if total := findCurrencyMatchOnLine(lines, []string{"gross amount", "amount due", "total due", "total"}); total != nil {
+			result.Fields["InvoiceTotal"] = makeCurrencyField(total, stringPtrFromAny(code))
+		}
+	}
+	if !hasFieldValue(result.Fields["SubTotal"]) {
+		if subtotal := findCurrencyMatchOnLine(lines, []string{"net amount", "net total", "subtotal"}); subtotal != nil {
+			result.Fields["SubTotal"] = makeCurrencyField(subtotal, stringPtrFromAny(code))
+		}
+	}
+	if !hasFieldValue(result.Fields["TotalTax"]) {
+		if tax := findCurrencyMatchOnLine(lines, []string{"vat", "tax", "vat amount", "tax amount"}); tax != nil {
+			result.Fields["TotalTax"] = makeCurrencyField(tax, stringPtrFromAny(code))
+		}
+	}
+	if !hasFieldValue(result.Fields["AmountDue"]) {
+		if amountDue := findCurrencyMatchOnLine(lines, []string{"amount due"}); amountDue != nil {
+			result.Fields["AmountDue"] = makeCurrencyField(amountDue, stringPtrFromAny(code))
+		}
+	}
+
+	if !hasFieldValue(result.Fields["CustomerName"]) || !hasFieldValue(result.Fields["CustomerAddress"]) {
+		if name, address := extractBillToFields(lines); name != "" || address != "" {
+			if !hasFieldValue(result.Fields["CustomerName"]) && name != "" {
+				result.Fields["CustomerName"] = makeStringField(stringPtrFromAny(name))
+			}
+			if !hasFieldValue(result.Fields["CustomerAddress"]) && address != "" {
+				result.Fields["CustomerAddress"] = makeStringField(stringPtrFromAny(address))
+			}
+		}
+	}
+
+	if !hasFieldValue(result.Fields["VendorName"]) {
+		if vendor := extractFirstStandaloneLine(lines); vendor != "" {
+			result.Fields["VendorName"] = makeStringField(stringPtrFromAny(vendor))
+		}
+	}
+}
+
+func hasFieldValue(field FieldValue) bool {
+	if field.Content != nil {
+		return true
+	}
+	if field.Value == nil {
+		return false
+	}
+	if m, ok := field.Value.(map[string]any); ok {
+		for _, v := range m {
+			if v != nil {
+				return true
+			}
+		}
+		return false
+	}
+	if s, ok := field.Value.(string); ok {
+		return strings.TrimSpace(s) != ""
+	}
+	return true
+}
+
+func splitLines(text string) []string {
+	return strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+}
+
+func extractFirstStandaloneLine(lines []string) string {
+	for _, line := range lines {
+		clean := strings.TrimSpace(line)
+		if clean == "" {
+			continue
+		}
+		lower := strings.ToLower(clean)
+		if strings.Contains(lower, "invoice") || strings.Contains(lower, "bill to:") || strings.Contains(lower, "due date") || strings.Contains(lower, "vat") || strings.Contains(lower, "amount") || strings.Contains(lower, "tax") {
+			continue
+		}
+		return clean
+	}
+	return ""
+}
+
+func extractBillToFields(lines []string) (string, string) {
+	for i, line := range lines {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if !strings.Contains(lower, "bill to:") && !strings.Contains(lower, "bill to") {
+			continue
+		}
+		name := ""
+		start := i + 1
+		if idx := strings.Index(line, ":"); idx >= 0 {
+			candidate := strings.TrimSpace(line[idx+1:])
+			if candidate != "" {
+				name = candidate
+			} else if start < len(lines) {
+				candidate := strings.TrimSpace(lines[start])
+				if candidate != "" && !isFieldBoundaryCandidate(candidate) {
+					name = candidate
+					start++
+				}
+			}
+		}
+		if name == "" {
+			for j := start; j < len(lines); j++ {
+				candidate := strings.TrimSpace(lines[j])
+				if candidate == "" {
+					continue
+				}
+				if isFieldBoundaryCandidate(candidate) {
+					break
+				}
+				name = candidate
+				start = j + 1
+				break
+			}
+		}
+		address := []string{}
+		for j := start; j < len(lines); j++ {
+			candidate := strings.TrimSpace(lines[j])
+			if candidate == "" {
+				continue
+			}
+			if isFieldBoundaryCandidate(candidate) || isLikelyItemDescriptionStart(lines, j) {
+				break
+			}
+			address = append(address, candidate)
+		}
+		return name, strings.Join(address, "\n")
+	}
+	return "", ""
+}
+
+func isFieldBoundaryCandidate(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "invoice date") || strings.Contains(lower, "due date") || strings.Contains(lower, "net amount") || strings.Contains(lower, "tax") || strings.Contains(lower, "gross amount") || strings.Contains(lower, "vat") || strings.Contains(lower, "total") || strings.Contains(lower, "amount due") || strings.Contains(lower, "invoice no") || strings.Contains(lower, "invoice #") || strings.Contains(lower, "invoice number")
+}
+
+func isLikelyItemDescriptionStart(lines []string, idx int) bool {
+	if idx+1 >= len(lines) {
+		return false
+	}
+	line := strings.TrimSpace(lines[idx])
+	next := strings.TrimSpace(lines[idx+1])
+	if line == "" || next == "" {
+		return false
+	}
+	if strings.Contains(line, ",") || strings.Contains(line, ".") || strings.Contains(line, ":") ||
+		strings.Contains(line, "£") || strings.Contains(line, "$") || strings.Contains(line, "€") || strings.Contains(line, "₹") {
+		return false
+	}
+	if isQuantityLine(next) && len(strings.Fields(line)) >= 2 {
+		return true
+	}
+	return false
+}
+
+func isQuantityLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	if _, err := strconv.Atoi(trimmed); err == nil {
+		return true
+	}
+	return false
+}
+
+func inferCurrencyCodeFromText(text string) string {
+	textLower := strings.ToLower(text)
+	if strings.Contains(text, "€") || strings.Contains(textLower, "eur") {
+		return "EUR"
+	}
+	if strings.Contains(text, "£") || strings.Contains(textLower, "gbp") {
+		return "GBP"
+	}
+	if strings.Contains(text, "$") || strings.Contains(textLower, "usd") {
+		return "USD"
+	}
+	if strings.Contains(text, "₹") || strings.Contains(textLower, "inr") {
+		return "INR"
+	}
+	return ""
+}
+
+func extractValueAfterLabel(lines []string, patterns []string) string {
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		for _, pattern := range patterns {
+			patternIdx := strings.Index(lower, pattern)
+			if patternIdx < 0 {
+				continue
+			}
+			colonIdx := strings.Index(line, ":")
+			if colonIdx >= 0 && colonIdx > patternIdx {
+				candidate := strings.TrimSpace(line[colonIdx+1:])
+				candidate = strings.Trim(candidate, ": \t\r\n")
+				if candidate != "" && !isFieldBoundaryCandidate(candidate) && !isLikelyItemDescriptionStart(lines, i) {
+					return strings.TrimSpace(candidate)
+				}
+			}
+			if i+1 < len(lines) {
+				candidate := strings.TrimSpace(lines[i+1])
+				candidate = strings.Trim(candidate, ": \t\r\n")
+				if candidate != "" && !isFieldBoundaryCandidate(candidate) && !isLikelyItemDescriptionStart(lines, i+1) {
+					return strings.TrimSpace(candidate)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func findCurrencyMatchOnLine(lines []string, patterns []string) *float64 {
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		for _, pattern := range patterns {
+			idx := strings.Index(lower, pattern)
+			if idx < 0 {
+				continue
+			}
+			candidate := ""
+			colonIdx := strings.Index(line, ":")
+			if colonIdx >= 0 && colonIdx > idx {
+				candidate = strings.TrimSpace(line[colonIdx+1:])
+			} else if i+1 < len(lines) {
+				candidate = strings.TrimSpace(lines[i+1])
+			}
+			candidate = strings.Trim(candidate, ": \t\r\n")
+			if curr := parseCurrencyAmount(candidate); curr != nil {
+				return curr
+			}
+		}
+	}
+	return nil
+}
+
+func parseCurrencyAmount(text string) *float64 {
+	text = strings.TrimSpace(strings.Trim(text, ": \t\r\n"))
+	if text == "" {
+		return nil
+	}
+	if regexp.MustCompile(`[A-Za-z]`).MatchString(text) {
+		return nil
+	}
+	text = strings.NewReplacer(",", "", "€", "", "$", "", "£", "", "₹", "", " ", "", "\t", "", "\n", "", "\r", "").Replace(text)
+	text = strings.TrimSpace(text)
+	if text == "" || !regexp.MustCompile(`\d`).MatchString(text) {
+		return nil
+	}
+	re := regexp.MustCompile(`[+-]?\d+(?:\.\d+)?`)
+	match := re.FindString(text)
+	if match == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(match, 64)
+	if err != nil {
+		return nil
+	}
+	return &f
+}
+
+func normalizeDateText(raw string) string {
+	return normalizeDateTextForLocale(raw, "en-GB")
+}
+
+func normalizeDateTextForLocale(raw string, locale string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	trimmedLower := strings.ToLower(locale)
+	if strings.Contains(trimmedLower, "en-gb") || strings.Contains(trimmedLower, "en-ie") || strings.Contains(trimmedLower, "en-au") || strings.Contains(trimmedLower, "en-nz") || strings.Contains(trimmedLower, "fr") || strings.Contains(trimmedLower, "de") || strings.Contains(trimmedLower, "es") || strings.Contains(trimmedLower, "it") {
+		for _, layout := range []string{"02-01-2006", "02/01/2006", "02.01.2006", "01-02-2006", "01/02/2006", "01.02.2006", "2006-01-02", "2006/01/02"} {
+			if t, err := time.Parse(layout, trimmed); err == nil {
+				return t.Format("2006-01-02")
+			}
+		}
+		return trimmed
+	}
+	for _, layout := range []string{"01-02-2006", "01/02/2006", "01.02.2006", "02-01-2006", "02/01/2006", "02.01.2006", "2006-01-02", "2006/01/02"} {
+		if t, err := time.Parse(layout, trimmed); err == nil {
+			return t.Format("2006-01-02")
+		}
+	}
+	return trimmed
+}
+
 func normalizeFieldValue(field map[string]any) FieldValue {
+	return normalizeFieldValueForLocale(field, "en-GB")
+}
+
+func normalizeFieldValueForLocale(field map[string]any, locale string) FieldValue {
 	kind, _ := field["type"].(string)
 	fieldValue := FieldValue{Type: kind}
 	if rawContent, ok := field["content"]; ok && rawContent != nil {
@@ -253,6 +599,22 @@ func normalizeFieldValue(field map[string]any) FieldValue {
 	}
 	if rawNumber, ok := field["valueNumber"].(float64); ok {
 		fieldValue.Value = rawNumber
+	}
+	if strings.EqualFold(kind, "date") {
+		candidate := ""
+		if text, ok := fieldValue.Content.(string); ok {
+			candidate = text
+		}
+		if candidate == "" {
+			if text, ok := fieldValue.Value.(string); ok {
+				candidate = text
+			}
+		}
+		if candidate != "" {
+			normalized := normalizeDateTextForLocale(candidate, locale)
+			fieldValue.Content = normalized
+			fieldValue.Value = normalized
+		}
 	}
 	return fieldValue
 }
@@ -358,15 +720,20 @@ func makeNumberField(value *float64) FieldValue {
 }
 
 func makeDateField(dateText *string) FieldValue {
+	return makeDateFieldForLocale(dateText, "en-GB")
+}
+
+func makeDateFieldForLocale(dateText *string, locale string) FieldValue {
 	if dateText == nil {
 		return FieldValue{Type: "date", Content: nil, Value: nil}
 	}
-	return FieldValue{Type: "date", Content: *dateText, Value: *dateText}
+	normalized := normalizeDateTextForLocale(*dateText, locale)
+	return FieldValue{Type: "date", Content: normalized, Value: normalized}
 }
 
 func makeCurrencyField(value *float64, currency *string) FieldValue {
 	if value == nil {
-		return FieldValue{Type: "currency", Content: nil, Value: map[string]any{"amount": nil, "currencyCode": nil}}
+		return FieldValue{Type: "currency", Content: nil, Value: nil}
 	}
 	currencyCode := ""
 	if currency != nil {
@@ -375,11 +742,23 @@ func makeCurrencyField(value *float64, currency *string) FieldValue {
 	return FieldValue{Type: "currency", Content: fmt.Sprintf("%.2f", *value), Value: map[string]any{"amount": *value, "currencyCode": currencyCode}}
 }
 
-func promptForModel(modelID string) string {
+func valueOrAmountMoney(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func promptForModel(modelID string, locale string) string {
 	if strings.HasPrefix(modelID, "prebuilt-read") {
 		return `Analyze the provided document and return readable content in a JSON object with "content" only.`
 	}
-	return `You are an invoice data extraction engine.
+	dateRule := "Dates in the source document may be written in DD-MM-YYYY or MM-DD-YYYY order. When normalizing to YYYY-MM-DD, treat the first number as the day and the second as the month for the requested locale."
+	trimmed := strings.ToLower(strings.TrimSpace(locale))
+	if !strings.Contains(trimmed, "en-gb") && !strings.Contains(trimmed, "en-ie") && !strings.Contains(trimmed, "en-au") && !strings.Contains(trimmed, "en-nz") && !strings.Contains(trimmed, "fr") && !strings.Contains(trimmed, "de") && !strings.Contains(trimmed, "es") && !strings.Contains(trimmed, "it") {
+		dateRule = "Dates in the source document may be written in DD-MM-YYYY or MM-DD-YYYY order. When normalizing to YYYY-MM-DD, treat the first number as the month and the second as the day unless the text clearly uses a day-first convention."
+	}
+	return fmt.Sprintf(`You are an invoice data extraction engine.
 
 Analyze the provided document and return exactly one valid JSON object.
 
@@ -417,7 +796,9 @@ Rules:
 - invoiceId: invoice number, not PO/account/customer number.
 - vendorName: issuer/seller.
 - customerName: bill-to/customer.
-- invoiceDate/dueDate: normalized YYYY-MM-DD when unambiguous.
+- locale: %s
+- %s
+- invoiceDate/dueDate: return exactly as printed in the source document; do not convert or reformat the date string.
 - subtotal, totalTax, invoiceTotal, amountDue: JSON numbers only.
 - currency: ISO currency code such as USD, EUR, GBP, BDT, or null.
 - items: extract actual product/service rows.
@@ -435,7 +816,16 @@ Each item must have this shape:
   "amount": null
 }
 
-Return one complete JSON object and nothing else.`
+Return one complete JSON object and nothing else.`, locale, dateRule)
+}
+
+func ollamaHTTPRequestTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("OLLAMA_HTTP_TIMEOUT_SECONDS")); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return 120 * time.Second
 }
 
 func modelName() string {

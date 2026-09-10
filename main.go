@@ -26,6 +26,7 @@ type AzureField struct {
 	ValueCurrency *CurrencyValue          `json:"valueCurrency,omitempty"`
 	ValueNumber   *float64                `json:"valueNumber,omitempty"`
 	ValueArray    []map[string]AzureField `json:"valueArray,omitempty"`
+	ValueObject   map[string]AzureField   `json:"valueObject,omitempty"`
 }
 
 type CurrencyValue struct {
@@ -138,6 +139,7 @@ type InvoiceJob struct {
 	OperationID string
 	ModelID     string
 	ContentType string
+	Locale      string
 }
 
 func main() {
@@ -246,7 +248,7 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	contentType, body, err := readUploadBody(req)
+	contentType, body, originalFilename, err := readUploadBody(req)
 	if err != nil {
 		writeError(resp, http.StatusBadRequest, "InvalidRequest", err.Error())
 		return
@@ -273,16 +275,9 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 		writeError(resp, http.StatusInternalServerError, "InternalServerError", "Failed to prepare upload directory")
 		return
 	}
-	fileext := ".pdf"
-	if strings.HasPrefix(strings.ToLower(contentType), "image/jpeg") {
-		fileext = ".jpg"
-	}
-	if strings.HasPrefix(strings.ToLower(contentType), "image/png") {
-		fileext = ".png"
-	}
 
 	opID := uuid.New().String()
-	finalfilename := fmt.Sprintf("upload-%s%s", opID, fileext)
+	finalfilename := buildUploadStorageName(originalFilename, contentType, opID)
 	finalFilepath := filepath.Join(uploadDir, finalfilename)
 	destFile, err := os.Create(finalFilepath)
 	if err != nil {
@@ -307,7 +302,11 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	opStore.Create(opID, modelID)
-	job := InvoiceJob{FilePath: finalFilepath, OperationID: opID, ModelID: modelID, ContentType: contentType}
+	locale := strings.TrimSpace(req.URL.Query().Get("locale"))
+	if locale == "" {
+		locale = "en-GB"
+	}
+	job := InvoiceJob{FilePath: finalFilepath, OperationID: opID, ModelID: modelID, ContentType: contentType, Locale: locale}
 	if err := workerPool.Submit(func() { processInvoiceAsync(job) }); err != nil {
 		_ = os.Remove(finalFilepath)
 		opStore.Update(opID, "failed", nil, "Ollama processing failed")
@@ -322,6 +321,15 @@ func handleAnalyzePOST(resp http.ResponseWriter, req *http.Request) {
 	json.NewEncoder(resp).Encode(map[string]string{"status": "running"})
 }
 
+func removeUploadFile(filePath string) {
+	if filePath == "" {
+		return
+	}
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("[cleanup] Failed to remove uploaded file %s: %v\n", filePath, err)
+	}
+}
+
 // processInvoiceAsync processes the uploaded document asynchronously.
 func processInvoiceAsync(job InvoiceJob) {
 	opID := job.OperationID
@@ -331,9 +339,7 @@ func processInvoiceAsync(job InvoiceJob) {
 			fmt.Printf("[%s] Worker panic recovered: %v\n", opID, r)
 			opStore.Update(opID, "failed", nil, fmt.Sprintf("worker panic: %v", r))
 		}
-		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("[%s] Failed to remove uploaded file %s: %v\n", opID, filePath, err)
-		}
+		removeUploadFile(filePath)
 	}()
 
 	fmt.Printf("[%s] Starting async processing...\n", opID)
@@ -359,7 +365,7 @@ func processInvoiceAsync(job InvoiceJob) {
 		}
 	}
 
-	extracted, err := CallOllamaOCRModel(base64Imgs, job.ModelID)
+	extracted, err := CallOllamaOCRModel(base64Imgs, job.ModelID, job.Locale)
 	if err != nil {
 		fmt.Printf("[%s] Ollama model processing failed: %v\n", opID, err)
 		opStore.Update(opID, "failed", nil, err.Error())
@@ -406,6 +412,10 @@ func handleGetAnalyzeResults(resp http.ResponseWriter, req *http.Request) {
 		writeError(resp, http.StatusNotFound, "ResultNotFound", "Operation not found")
 		return
 	}
+	if op.Status == "running" && time.Since(op.CreatedAt) > ollamaHTTPRequestTimeout() {
+		opStore.Update(resultID, "failed", nil, fmt.Sprintf("ollama request timed out after %s", ollamaHTTPRequestTimeout()))
+		op, _ = opStore.Get(resultID)
+	}
 
 	resp.Header().Set("Content-Type", "application/json")
 	resp.WriteHeader(http.StatusOK)
@@ -446,12 +456,12 @@ func keyFromRequest(req *http.Request) string {
 	return req.URL.Query().Get("key")
 }
 
-func readUploadBody(req *http.Request) (string, []byte, error) {
+func readUploadBody(req *http.Request) (string, []byte, string, error) {
 	contentType := req.Header.Get("Content-Type")
 	if strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
 		mr, err := req.MultipartReader()
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to decode multipart upload")
+			return "", nil, "", fmt.Errorf("failed to decode multipart upload")
 		}
 		for {
 			part, err := mr.NextPart()
@@ -459,24 +469,70 @@ func readUploadBody(req *http.Request) (string, []byte, error) {
 				break
 			}
 			if err != nil {
-				return "", nil, fmt.Errorf("failed to read multipart file part")
+				return "", nil, "", fmt.Errorf("failed to read multipart file part")
 			}
 			if part.FormName() == "file" || part.FormName() == "document" || part.FormName() == "pdf" {
 				fileContentType := part.Header.Get("Content-Type")
 				body, err := io.ReadAll(part)
 				if err != nil {
-					return "", nil, fmt.Errorf("failed to read multipart file")
+					return "", nil, "", fmt.Errorf("failed to read multipart file")
 				}
-				return fileContentType, body, nil
+				return fileContentType, body, part.FileName(), nil
 			}
 		}
-		return "", nil, fmt.Errorf("missing document file part")
+		return "", nil, "", fmt.Errorf("missing document file part")
 	}
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to read document")
+		return "", nil, "", fmt.Errorf("failed to read document")
 	}
-	return contentType, body, nil
+	return contentType, body, "", nil
+}
+
+func buildUploadStorageName(originalFilename, contentType, opID string) string {
+	base, ext := splitBaseAndExtension(originalFilename)
+	if ext == "" {
+		ext = extensionFromContentType(contentType)
+	}
+	if base == "" {
+		base = "document"
+	}
+	base = normalizeAllowedUploadName(base)
+	if base == "" {
+		base = "document"
+	}
+	return fmt.Sprintf("%s-%s%s", base, opID, ext)
+}
+
+func splitBaseAndExtension(filename string) (string, string) {
+	idx := strings.LastIndex(filename, ".")
+	if idx <= 0 || idx == len(filename)-1 {
+		return strings.TrimSpace(filename), ""
+	}
+	return strings.TrimSpace(filename[:idx]), strings.ToLower(filename[idx:])
+}
+
+func extensionFromContentType(contentType string) string {
+	lower := strings.ToLower(contentType)
+	if strings.HasPrefix(lower, "application/pdf") {
+		return ".pdf"
+	}
+	if strings.HasPrefix(lower, "image/jpeg") {
+		return ".jpg"
+	}
+	if strings.HasPrefix(lower, "image/png") {
+		return ".png"
+	}
+	return ".bin"
+}
+
+func normalizeAllowedUploadName(name string) string {
+	allowed := regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
+	name = allowed.ReplaceAllString(name, "")
+	name = strings.Trim(name, " ._-")
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.ReplaceAll(name, "_", "-")
+	return name
 }
 
 func writeError(resp http.ResponseWriter, status int, code, message string) {
@@ -548,7 +604,8 @@ func mapFieldValueToAzureField(name string, fv FieldValue) AzureField {
 		}
 		if obj, ok := fv.Value.(map[string]any); ok {
 			if amount, ok := obj["amount"].(float64); ok {
-				field.ValueCurrency = &CurrencyValue{Amount: amount, CurrencyCode: obj["currencyCode"].(string)}
+				code, _ := obj["currencyCode"].(string)
+				field.ValueCurrency = &CurrencyValue{Amount: amount, CurrencyCode: code}
 			}
 			if code, ok := obj["currencyCode"].(string); ok {
 				if field.ValueCurrency == nil {
@@ -579,6 +636,15 @@ func mapFieldValueToAzureField(name string, fv FieldValue) AzureField {
 				rows = append(rows, row)
 			}
 			field.ValueArray = rows
+		}
+	}
+	if fv.Type == "object" {
+		if objectValue, ok := fv.Value.(map[string]FieldValue); ok {
+			row := map[string]AzureField{}
+			for key, inner := range objectValue {
+				row[key] = mapFieldValueToAzureField(key, inner)
+			}
+			field.ValueObject = row
 		}
 	}
 	return field

@@ -112,6 +112,241 @@ func TestSimulateStatusOnAnalyzePollReturnsAzureErrorAndRetryAfter(t *testing.T)
 	}
 }
 
+func TestParseOllamaJSONMapsTaxDetailsArrayAndObjectShape(t *testing.T) {
+	raw := `{
+		"documentType": "invoice",
+		"content": "Invoice text",
+		"invoiceId": "INV-001",
+		"vendorName": "Acme",
+		"vendorAddress": "",
+		"customerName": "Contoso",
+		"customerAddress": "",
+		"invoiceDate": "2026-04-05",
+		"dueDate": "",
+		"purchaseOrder": "",
+		"subtotal": 100.0,
+		"totalTax": 20.0,
+		"invoiceTotal": 120.0,
+		"amountDue": 120.0,
+		"currency": "GBP",
+		"taxDetails": [
+			{"amount": 200.0, "rate": "20%"},
+			{"amount": 0.0, "rate": "0%"}
+		]
+	}`
+
+	parsed, err := parseOllamaJSON(raw, "prebuilt-invoice")
+	if err != nil {
+		t.Fatalf("expected parser to accept invoice envelope with taxDetails array, got error: %v", err)
+	}
+	field, ok := parsed.Fields["TaxDetails"]
+	if !ok {
+		t.Fatal("expected parser to carry TaxDetails field map entry for the tax details array")
+	}
+	if field.Type != "array" {
+		t.Fatalf("expected TaxDetails field type array, got %q", field.Type)
+	}
+	rows, ok := field.Value.([]map[string]FieldValue)
+	if !ok {
+		t.Fatalf("expected TaxDetails value to remain an array of object maps, got %T", field.Value)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected two tax detail rows, got %d", len(rows))
+	}
+	if _, ok := rows[0]["Amount"]; !ok {
+		t.Fatal("expected TaxDetails row object to contain an Amount field")
+	}
+	if _, ok := rows[0]["Rate"]; !ok {
+		t.Fatal("expected TaxDetails row object to contain a Rate field")
+	}
+}
+
+func TestParseOllamaJSONInfersFieldsFromSynonymContentLabelsAndCurrencySymbol(t *testing.T) {
+	raw := `{
+		"documentType": "invoice",
+		"content": "Rotterdam Bunkering & Logistics BV\nInvoice No.: RBL-2026-0774\nInvoice Date: 03-08-2026\nDue Date: 02-09-2026\nBill To: Clarksons Shipbroking Services Limited\nNet Amount: €3,200.00\nVAT (21%): €672.00\nGross Amount: €3,872.00",
+		"invoiceId": "",
+		"vendorName": "",
+		"vendorAddress": "",
+		"customerName": "",
+		"customerAddress": "",
+		"invoiceDate": "",
+		"dueDate": "",
+		"purchaseOrder": "",
+		"subtotal": null,
+		"totalTax": null,
+		"invoiceTotal": null,
+		"amountDue": null,
+		"currency": ""
+	}`
+
+	parsed, err := parseOllamaJSON(raw, "prebuilt-invoice")
+	if err != nil {
+		t.Fatalf("expected parser to infer fields from synonym labels in content, got error: %v", err)
+	}
+	if got := parsed.Fields["InvoiceId"]; got.Type == "string" && got.Content == "" {
+		t.Fatal("expected parser to recover InvoiceId from Invoice No. label")
+	}
+	if got := parsed.Fields["SubTotal"]; got.Type == "currency" && got.Content == "" {
+		t.Fatal("expected parser to recover SubTotal from Net Amount label")
+	}
+	if got := parsed.Fields["TotalTax"]; got.Type == "currency" && got.Content == "" {
+		t.Fatal("expected parser to recover TotalTax from VAT label")
+	}
+	if got := parsed.Fields["InvoiceTotal"]; got.Type == "currency" && got.Content == "" {
+		t.Fatal("expected parser to recover InvoiceTotal from Gross Amount label")
+	}
+	if got := parsed.Fields["CurrencyCode"]; got.Type == "string" && got.Content == "" {
+		t.Fatal("expected parser to infer CurrencyCode from the currency symbol in content")
+	}
+}
+
+func TestParseOllamaJSONNormalizesDatesFromDDMMYYYYToISO(t *testing.T) {
+	raw := `{
+		"documentType": "invoice",
+		"content": "Invoice text",
+		"invoiceId": "INV-001",
+		"vendorName": "Acme",
+		"vendorAddress": "",
+		"customerName": "Contoso",
+		"customerAddress": "",
+		"invoiceDate": "03-08-2026",
+		"dueDate": "02-09-2026",
+		"purchaseOrder": "",
+		"subtotal": 100.0,
+		"totalTax": 20.0,
+		"invoiceTotal": 120.0,
+		"amountDue": 120.0,
+		"currency": "EUR"
+	}`
+
+	parsed, err := parseOllamaJSON(raw, "prebuilt-invoice")
+	if err != nil {
+		t.Fatalf("expected parser to accept invoice envelope and normalize date fields, got error: %v", err)
+	}
+	if got := parsed.Fields["InvoiceDate"].Content; got != "2026-08-03" {
+		t.Fatalf("expected invoice date to be normalized as YYYY-MM-DD, got %v", got)
+	}
+	if got := parsed.Fields["DueDate"].Content; got != "2026-09-02" {
+		t.Fatalf("expected due date to be normalized as YYYY-MM-DD, got %v", got)
+	}
+}
+
+func TestParseOllamaJSONKeepsInvoiceAndAddressFallbacksLineBounded(t *testing.T) {
+	raw := `{
+		"documentType": "invoice",
+		"content": "Rotterdam Bunkering & Logistics BV\nInvoice No.: INV-10482\nInvoice Date: 06-08-2026\nDue Date: 05-09-2026\nBill To:\nClarksons Shipbroking Services Limited\nSt. Magnus House\n3 Lower Thames Street\nLondon EC3R 6HD\nUnited Kingdom\nCrew Change Arrangements\n1\n1,000.00\n1,000.00\nNet Amount: £1,000.00\nVAT (20%): £200.00\nGross Amount: £1,200.00",
+		"invoiceId": "",
+		"vendorName": "",
+		"vendorAddress": "",
+		"customerName": "",
+		"customerAddress": "",
+		"invoiceDate": "",
+		"dueDate": "",
+		"purchaseOrder": "",
+		"subtotal": null,
+		"totalTax": null,
+		"invoiceTotal": null,
+		"amountDue": null,
+		"currency": ""
+	}`
+
+	parsed, err := parseOllamaJSON(raw, "prebuilt-invoice")
+	if err != nil {
+		t.Fatalf("expected parser to recover invoice metadata from content line-boundaries, got error: %v", err)
+	}
+	invoiceID := parsed.Fields["InvoiceId"]
+	if got, ok := invoiceID.Value.(string); !ok || got != "INV-10482" {
+		t.Fatalf("expected parser to return a bounded InvoiceId value, got %#v", invoiceID.Value)
+	}
+	addr := parsed.Fields["CustomerAddress"]
+	if got, ok := addr.Value.(string); ok && strings.Contains(got, "Crew Change Arrangements") {
+		t.Fatalf("expected parser to stop CustomerAddress before an item-description row, got %q", got)
+	}
+}
+
+func TestParseOllamaJSONInfersInvoiceAmountFieldsFromContentWhenEnvelopeValuesAreNull(t *testing.T) {
+	raw := `{
+		"documentType": "invoice",
+		"content": "Rotterdam Bunkering & Logistics BV\nInvoice No.: INV-10482\nInvoice Date: 06-08-2026\nDue Date: 05-09-2026\nBill To:\nClarksons Shipbroking Services Limited\nSt. Magnus House\n3 Lower Thames Street\nLondon EC3R 6HD\nUnited Kingdom\nCrew Change Arrangements\n1\n1,000.00\n1,000.00\nNet Amount: £1,000.00\nVAT (20%): £200.00\nGross Amount: £1,200.00",
+		"invoiceId": null,
+		"vendorName": null,
+		"vendorAddress": null,
+		"customerName": null,
+		"customerAddress": null,
+		"invoiceDate": null,
+		"dueDate": null,
+		"purchaseOrder": null,
+		"subtotal": null,
+		"totalTax": null,
+		"invoiceTotal": null,
+		"amountDue": null,
+		"currency": null
+	}`
+
+	parsed, err := parseOllamaJSON(raw, "prebuilt-invoice")
+	if err != nil {
+		t.Fatalf("expected parser to recover amount fields from the content fallback envelope, got error: %v", err)
+	}
+	if got := parsed.Fields["SubTotal"].Content; got == "" || got == "<nil>" {
+		t.Fatalf("expected parser to recover SubTotal from Net Amount label in content, got %#v", parsed.Fields["SubTotal"])
+	}
+	if got := parsed.Fields["TotalTax"].Content; got == "" || got == "<nil>" {
+		t.Fatalf("expected parser to recover TotalTax from VAT label in content, got %#v", parsed.Fields["TotalTax"])
+	}
+	if got := parsed.Fields["InvoiceTotal"].Content; got == "" || got == "<nil>" {
+		t.Fatalf("expected parser to recover InvoiceTotal from Gross Amount label in content, got %#v", parsed.Fields["InvoiceTotal"])
+	}
+	if got := parsed.Fields["CustomerAddress"].Value; got == nil {
+		t.Fatal("expected parser to keep a non-empty CustomerAddress recovery from the bounded bill-to scan")
+	} else if addr, ok := got.(string); !ok || strings.Contains(addr, "Crew Change Arrangements") {
+		t.Fatalf("expected parser to stop CustomerAddress before item lines, got %#v", parsed.Fields["CustomerAddress"])
+	}
+}
+
+func TestPromptForModelIncludesLocaleAwareDateInstruction(t *testing.T) {
+	prompt := promptForModel("prebuilt-invoice", "en-GB")
+	if !strings.Contains(prompt, "DD-MM-YYYY") || !strings.Contains(prompt, "day") || !strings.Contains(prompt, "locale") {
+		t.Fatalf("expected invoice prompt to carry an explicit locale-aware, day-first date instruction, got %q", prompt)
+	}
+}
+
+func TestParseCurrencyAmountRejectsInvoiceIdentifierLikeText(t *testing.T) {
+	if got := parseCurrencyAmount("INV-10482"); got != nil {
+		t.Fatalf("expected parser to reject letter-bearing invoice IDs as a currency amount, got %#v", got)
+	}
+}
+
+func TestNormalizeDateTextUsesDayFirstOrdering(t *testing.T) {
+	if got := normalizeDateText("03-08-2026"); got != "2026-08-03" {
+		t.Fatalf("expected DD-MM-YYYY input to normalize to 2026-08-03, got %q", got)
+	}
+	if got := normalizeDateText("02-09-2026"); got != "2026-09-02" {
+		t.Fatalf("expected DD-MM-YYYY input to normalize to 2026-09-02, got %q", got)
+	}
+}
+
+func TestParseOllamaJSONForLocaleNormalizesDateFieldsFromFieldsObject(t *testing.T) {
+	raw := `{
+		"content": "Invoice text",
+		"fields": {
+			"InvoiceDate": {
+				"type": "date",
+				"content": "03-08-2026",
+				"value": "03-08-2026"
+			}
+		}
+	}`
+
+	parsed, err := parseOllamaJSONForLocale(raw, "prebuilt-invoice", "en-GB")
+	if err != nil {
+		t.Fatalf("expected parser to accept locale-aware date value fields, got error: %v", err)
+	}
+	if got := parsed.Fields["InvoiceDate"].Content; got != "2026-08-03" {
+		t.Fatalf("expected locale-aware fields parser to normalize InvoiceDate to ISO date, got %#v", got)
+	}
+}
+
 func TestParseOllamaJSONAcceptsContentAndFieldsWithoutDocumentType(t *testing.T) {
 	raw := `{
 		"content": "Invoice text",
